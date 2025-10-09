@@ -1,134 +1,189 @@
-// background service worker
+// background service worker (manifest v3)
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg.action === 'collect_gifs') {
-    chrome.scripting.executeScript({
-      target: { tabId: msg.tabId },
-      func: pageCrawler,
-      args: [msg.depth]
-    }).then((results) => {
-      const gifUrls = (results?.[0]?.result) || [];
-      if (!gifUrls.length) {
-        sendResponse({ message: 'No GIFs found.' });
-        return;
+  if (msg.action !== 'collect_gifs') return;
+  const { tabId, cfg } = msg;
+  if (!tabId) { sendResponse({ message: 'No tab id' }); return; }
+
+  // Inject the crawler into the page context. It will return an array of GIF URLs it discovered.
+  chrome.scripting.executeScript({
+    target: { tabId },
+    func: pageCrawler,
+    args: [cfg.depth, cfg.includeSubdomains, cfg.maxPages]
+  }).then((results) => {
+    // results can include results from multiple frames; merge them
+    let urls = [];
+    for (const r of results) {
+      if (r && r.result && Array.isArray(r.result)) urls = urls.concat(r.result);
+    }
+    urls = Array.from(new Set(urls)); // dedupe
+    if (!urls.length) {
+      sendResponse({ message: 'No GIFs found.', found: 0, started: 0, errors: [] });
+      return;
+    }
+
+    const errors = [];
+    let started = 0;
+
+    // helper: make safe filename
+    function makeFilename(urlStr, preservePath) {
+      try {
+        const u = new URL(urlStr);
+        let pathname = decodeURIComponent(u.pathname || '').replace(/^\/+/, '');
+        if (!pathname) pathname = u.hostname + '_file';
+        // remove query-related junk
+        pathname = pathname.split('?')[0];
+        // sanitize path segments
+        const parts = pathname.split('/').map(p => p.replace(/[<>:"\\|?*\x00-\x1F]/g, '_'));
+        const safe = parts.join('/');
+        return preservePath ? `gifs/${safe}` : `gifs/${parts[parts.length - 1] || 'file.gif'}`;
+      } catch (e) {
+        // fallback
+        const name = urlStr.split('/').pop().split('?')[0] || 'file.gif';
+        return `gifs/${name.replace(/[<>:"\\|?*\x00-\x1F]/g, '_')}`;
       }
+    }
 
-      let downloaded = 0;
-      for (const u of gifUrls) {
-        const url = u;
-        // derive a safe filename from the URL and preserve path if requested:
-        let pathname = (new URL(url)).pathname; // e.g., /images/foo/bar.gif
-        pathname = pathname.replace(/^\//, ''); // remove leading slash
-        // sanitize filename pieces to remove problematic chars
-        const safePath = pathname.split('/').map(p => p.replace(/[<>:"\\|?*\x00-\x1F]/g, '_')).join('/');
-        const filename = msg.preservePath ? `gifs/${safePath}` : `gifs/${url.split('/').pop().split('?')[0]}`;
-
-        chrome.downloads.download({ url, filename }, (dlId) => {
-          // ignore errors here; continue
-          downloaded++;
-          // Optionally: you could collect errors via chrome.runtime.lastError
+    // start downloads (fire-and-forget). Chrome may throttle many simultaneous downloads;
+    // we attempt to start them sequentially with a small gap to be polite.
+    const gapMs = 120; // small gap between downloads
+    urls.forEach((u, i) => {
+      const filename = makeFilename(u, cfg.preservePath);
+      setTimeout(() => {
+        chrome.downloads.download({ url: u, filename }, (dlId) => {
+          if (chrome.runtime.lastError) {
+            errors.push({ url: u, error: chrome.runtime.lastError.message });
+          } else {
+            started++;
+          }
+          // Note: we don't wait for all downloads to finish here; we report started / errors seen at scheduling time.
         });
-      }
-
-      sendResponse({ message: `Started ${gifUrls.length} downloads (check your Downloads folder).` });
-    }).catch(err => {
-      sendResponse({ message: 'Error running crawler: ' + (err && err.message) });
+      }, i * gapMs);
     });
 
-    // keep channel open for sendResponse async
-    return true;
-  }
+    // respond immediately with summary (downloads have been scheduled)
+    sendResponse({ message: 'Downloads scheduled — check your Downloads folder.', found: urls.length, started, errors });
+  }).catch((err) => {
+    sendResponse({ message: 'Injection failed: ' + (err && err.message), found: 0, started: 0, errors: [] });
+  });
+
+  // keep channel open for async sendResponse
+  return true;
 });
 
-
-// This function runs in the page context.
-// It finds .gif URLs on the current page and (optionally) follows same-origin
-// links up to the requested depth (depth: 0 = current page only, 1 = follow links one level).
-async function pageCrawler(depth = 0) {
+/*
+ This function is injected into the page and runs in page context.
+ It finds .gif URLs on the current DOM and (optionally) fetches and parses linked pages
+ up to the given depth. It returns an array of absolute GIF URLs.
+ Note: cross-origin fetches are subject to CORS and may fail — that's normal.
+*/
+async function pageCrawler(depth = 0, includeSubdomains = false, maxPages = 200) {
   const origin = location.origin;
+  const startHost = location.hostname;
+  const hostParts = startHost.split('.');
+  const baseDomain = hostParts.slice(-2).join('.'); // simple heuristic: example.xyz or example.com
+
   const visited = new Set();
   const results = new Set();
+  let pagesVisited = 0;
 
-  // helper: extract gif URLs from a document
+  // collect GIF links from a Document object
   function collectFromDoc(doc, baseURL) {
-    // img tags
-    for (const img of Array.from(doc.images || [])) {
-      try {
-        const src = new URL(img.src, baseURL).href;
-        if (src.toLowerCase().split('?')[0].endsWith('.gif')) results.add(src);
-      } catch(e) { /* ignore */ }
-    }
-    // anchors that directly link to gif files
-    for (const a of Array.from(doc.querySelectorAll('a[href]'))) {
-      try {
-        const href = new URL(a.getAttribute('href'), baseURL).href;
-        if (href.toLowerCase().split('?')[0].endsWith('.gif')) results.add(href);
-      } catch(e) {}
-    }
-    // CSS background-image references (simple heuristic)
-    const elems = Array.from(doc.querySelectorAll('*[style]'));
-    for (const el of elems) {
-      const m = (el.style && el.style.backgroundImage) || '';
-      const urlMatch = /url\((['"]?)([^'")]+)\1\)/.exec(m);
-      if (urlMatch) {
+    try {
+      // img[src]
+      for (const img of Array.from(doc.images || [])) {
         try {
-          const bg = new URL(urlMatch[2], baseURL).href;
-          if (bg.toLowerCase().split('?')[0].endsWith('.gif')) results.add(bg);
-        } catch(e){}
+          const src = new URL(img.src, baseURL).href;
+          if (src.toLowerCase().split('?')[0].endsWith('.gif')) results.add(src);
+        } catch (e) {}
       }
+      // anchor hrefs
+      for (const a of Array.from(doc.querySelectorAll('a[href]'))) {
+        try {
+          const href = new URL(a.getAttribute('href'), baseURL).href;
+          if (href.toLowerCase().split('?')[0].endsWith('.gif')) results.add(href);
+        } catch (e) {}
+      }
+      // inline styles background-image
+      for (const el of Array.from(doc.querySelectorAll('*[style]'))) {
+        try {
+          const m = (el.style && el.style.backgroundImage) || '';
+          const urlMatch = /url\\((['"]?)([^'")]+)\\1\\)/.exec(m);
+          if (urlMatch) {
+            const bg = new URL(urlMatch[2], baseURL).href;
+            if (bg.toLowerCase().split('?')[0].endsWith('.gif')) results.add(bg);
+          }
+        } catch (e) {}
+      }
+    } catch (e) {}
+  }
+
+  function isInScope(urlObj) {
+    try {
+      if (urlObj.origin === origin) return true;
+      if (includeSubdomains) {
+        if (urlObj.hostname === baseDomain) return true;
+        if (urlObj.hostname.endsWith('.' + baseDomain)) return true;
+      }
+    } catch (e) { return false; }
+    return false;
+  }
+
+  // simple BFS queue: {url, depthLevel}
+  const queue = [];
+
+  // collect from current DOM first (this is immediate, not CORS-blocked)
+  try { collectFromDoc(document, location.href); } catch (e) {}
+
+  // seed queue with links on the current page (if we need to go deeper)
+  if (depth > 0) {
+    for (const a of Array.from(document.querySelectorAll('a[href]'))) {
+      try {
+        const hrefObj = new URL(a.getAttribute('href'), location.href);
+        if (isInScope(hrefObj)) {
+          const normalized = hrefObj.href.split('#')[0];
+          queue.push({ url: normalized, d: 1 });
+        }
+      } catch (e) {}
     }
   }
 
-  async function visitPage(url, currentDepth) {
+  async function visit(url, currentDepth) {
     if (visited.has(url)) return;
+    if (pagesVisited >= maxPages) return;
     visited.add(url);
+    pagesVisited++;
+
     try {
+      // Attempt to fetch the page. This may fail for cross-origin pages (CORS).
       const resp = await fetch(url, { credentials: 'same-origin' });
+      if (!resp.ok) return;
       const text = await resp.text();
       const parser = new DOMParser();
       const doc = parser.parseFromString(text, 'text/html');
       collectFromDoc(doc, url);
 
       if (currentDepth < depth) {
-        // find same-origin links and queue them
-        const anchors = Array.from(doc.querySelectorAll('a[href]'));
-        for (const a of anchors) {
+        for (const a of Array.from(doc.querySelectorAll('a[href]'))) {
           try {
-            const href = new URL(a.getAttribute('href'), url);
-            if (href.origin === origin) {
-              const normalized = href.href.split('#')[0];
-              if (!visited.has(normalized)) {
-                await visitPage(normalized, currentDepth + 1);
+            const hrefObj = new URL(a.getAttribute('href'), url);
+            if (isInScope(hrefObj)) {
+              const normalized = hrefObj.href.split('#')[0];
+              if (!visited.has(normalized) && pagesVisited < maxPages) {
+                queue.push({ url: normalized, d: currentDepth + 1 });
               }
             }
-          } catch(e){}
+          } catch (e) {}
         }
       }
     } catch (e) {
-      // network/CORS/etc — ignore and continue
+      // fetch/CORS errors are expected sometimes: ignore and continue
     }
   }
 
-  // start with current document (fast)
-  try {
-    collectFromDoc(document, location.href);
-  } catch (e) {}
-
-  if (depth > 0) {
-    // gather same-origin links from the current page and visit them (one level)
-    const anchors = Array.from(document.querySelectorAll('a[href]'));
-    const toVisit = [];
-    for (const a of anchors) {
-      try {
-        const href = new URL(a.getAttribute('href'), location.href);
-        if (href.origin === origin) {
-          toVisit.push(href.href.split('#')[0]);
-        }
-      } catch(e){}
-    }
-    // visit each (sequentially to avoid hammering)
-    for (const v of toVisit) {
-      if (!visited.has(v)) await visitPage(v, 1);
-    }
+  // process queue sequentially (safer re: site load)
+  while (queue.length && pagesVisited < maxPages) {
+    const item = queue.shift();
+    await visit(item.url, item.d);
   }
 
   return Array.from(results);
