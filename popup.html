@@ -1,36 +1,80 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
   <style>
-    body { font-family: Arial, sans-serif; width:300px; padding:12px; }
-    label { display:block; margin-top:8px; }
-    button { margin-top:12px; padding:8px 10px; }
+    body { font-family: system-ui, Arial; width:320px; padding:14px; }
+    h3 { margin:0 0 8px 0; font-size:16px; }
+    .row { margin:8px 0; }
+    label { display:block; font-size:13px; margin-bottom:6px; }
+    input[type="range"] { width:100%; }
+    button { padding:8px 12px; margin-top:8px; width:100%; }
+    #status { margin-top:10px; font-size:13px; min-height:24px; }
+    small { color:#666; }
   </style>
 </head>
 <body>
   <h3>GIF Collector</h3>
-  <label>
-    Crawl depth:
-    <select id="depth">
-      <option value="0">0 — current page only</option>
-      <option value="1" selected>1 — follow same-origin links (one level)</option>
-    </select>
-  </label>
-  <label><input type="checkbox" id="preservePath" checked> Preserve remote path in filename</label>
+
+  <div class="row">
+    <label>Depth: <span id="depthValue">1</span> <small>(0 = current page only)</small></label>
+    <input id="depth" type="range" min="0" max="3" value="1" />
+  </div>
+
+  <div class="row">
+    <label><input id="includeSubdomains" type="checkbox" checked /> Include subdomains (e.g., maps.example.xyz)</label>
+    <label><input id="preservePath" type="checkbox" checked /> Preserve remote path in filename</label>
+  </div>
+
+  <div class="row">
+    <label>Max pages to visit: <input id="maxPages" type="number" value="200" min="1" style="width:90px; margin-left:8px;" /></label>
+    <small>Keep this reasonable to avoid big crawls.</small>
+  </div>
+
   <button id="run">Find & Download GIFs</button>
-  <div id="status" style="margin-top:10px; font-size:13px"></div>
+  <div id="status"></div>
 
   <script>
-    document.getElementById('run').addEventListener('click', async () => {
-      const depth = Number(document.getElementById('depth').value);
-      const preservePath = document.getElementById('preservePath').checked;
+    const depth = document.getElementById('depth');
+    const depthValue = document.getElementById('depthValue');
+    const runBtn = document.getElementById('run');
+    const status = document.getElementById('status');
 
-      document.getElementById('status').textContent = 'Running...';
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      chrome.runtime.sendMessage({ action: 'collect_gifs', tabId: tab.id, depth, preservePath }, (resp) => {
-        document.getElementById('status').textContent = resp?.message || 'Done';
-      });
+    depth.addEventListener('input', () => { depthValue.textContent = depth.value; });
+
+    runBtn.addEventListener('click', async () => {
+      status.textContent = 'Starting…';
+      runBtn.disabled = true;
+
+      const cfg = {
+        depth: Number(depth.value),
+        includeSubdomains: document.getElementById('includeSubdomains').checked,
+        preservePath: document.getElementById('preservePath').checked,
+        maxPages: Number(document.getElementById('maxPages').value) || 200
+      };
+
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (!tab?.id) throw new Error('No active tab found.');
+
+        chrome.runtime.sendMessage({ action: 'collect_gifs', tabId: tab.id, cfg }, (resp) => {
+          runBtn.disabled = false;
+          if (!resp) {
+            status.textContent = 'No response from background script — check console.';
+            return;
+          }
+          // Friendly status summary
+          const parts = [];
+          if (resp.found) parts.push(`Found: ${resp.found} GIF(s)`);
+          if (resp.started) parts.push(`Started: ${resp.started} downloads`);
+          if (resp.errors && resp.errors.length) parts.push(`Errors: ${resp.errors.length}`);
+          if (resp.message) parts.push(resp.message);
+          status.textContent = parts.join(' · ');
+        });
+      } catch (err) {
+        runBtn.disabled = false;
+        status.textContent = 'Error: ' + (err.message || err);
+      }
     });
   </script>
 </body>
