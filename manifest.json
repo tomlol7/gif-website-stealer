@@ -1,11 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "Safe GIF Collector",
-  "version": "1.0",
-  "description": "Collects and downloads .gif files from the current page (use only on sites you own or have permission to use).",
-  "permissions": ["downloads", "scripting", "activeTab", "storage"],
+  "name": "GIF Collector (Fixed)",
+  "version": "1.1",
+  "description": "Finds & downloads .gif files from the current page and linked paths (use only on sites you own/have permission to).",
+  "permissions": [
+    "downloads",
+    "scripting",
+    "activeTab",
+    "storage"
+  ],
+  "host_permissions": ["<all_urls>"],
   "action": {
-    "default_title": "Collect GIFs",
+    "default_title": "GIF Collector",
     "default_popup": "popup.html"
   },
   "background": {
