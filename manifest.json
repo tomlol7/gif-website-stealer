@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Safe GIF Collector",
+  "version": "1.0",
+  "description": "Collects and downloads .gif files from the current page (use only on sites you own or have permission to use).",
+  "permissions": ["downloads", "scripting", "activeTab", "storage"],
+  "action": {
+    "default_title": "Collect GIFs",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
